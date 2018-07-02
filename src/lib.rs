@@ -5,6 +5,8 @@
 #[macro_use] extern crate tokio_io;
 extern crate rustls;
 extern crate webpki;
+#[macro_use]
+extern crate log;
 
 pub mod proto;
 
@@ -111,19 +113,40 @@ impl<S, C> Future for MidHandshake<S, C>
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
+            debug!("midhandshake poll");
             let stream = self.inner.as_mut().unwrap();
-            if !stream.session.is_handshaking() { break };
+            if !stream.session.is_handshaking() {
+                debug!("session is not handshaking");
+                break };
 
             match stream.do_io() {
                 Ok(()) => match (stream.eof, stream.session.is_handshaking()) {
-                    (true, true) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                    (false, true) => continue,
-                    (..) => break
+                    (true, true) => {
+                        debug!("tokio-rustls unexpectedeof");
+                        return Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                    }
+                    (false, true) => {
+                        debug!("poll false true");
+                        continue
+                    },
+                    (..) => {
+                        debug!("else");
+                        break
+                    }
                 },
                 Err(e) => match (e.kind(), stream.session.is_handshaking()) {
-                    (io::ErrorKind::WouldBlock, true) => return Ok(Async::NotReady),
-                    (io::ErrorKind::WouldBlock, false) => break,
-                    (..) => return Err(e)
+                    (io::ErrorKind::WouldBlock, true) => {
+                        debug!("would block true");
+                        return Ok(Async::NotReady)
+                    },
+                    (io::ErrorKind::WouldBlock, false) => {
+                        debug!("would block false");
+                        break
+                    },
+                    (..) => {
+                        debug!("else error");
+                        return Err(e)
+                    }
                 }
             }
         }
@@ -171,14 +194,17 @@ impl<S, C> TlsStream<S, C>
             let read_would_block = if !self.eof && self.session.wants_read() {
                 match self.session.read_tls(&mut self.io) {
                     Ok(0) => {
+                        debug!("do io read tls ok 0");
                         self.eof = true;
                         continue
                     },
                     Ok(_) => {
+                        debug!("do io ok else");
                         if let Err(err) = self.session.process_new_packets() {
                             // flush queued messages before returning an Err in
                             // order to send alerts instead of abruptly closing
                             // the socket
+                            debug!("ok else process error: {:?}", err);
                             if self.session.wants_write() {
                                 // ignore result to avoid masking original error
                                 let _ = self.session.write_tls(&mut self.io);
@@ -219,11 +245,22 @@ impl<S, C> io::Read for TlsStream<S, C>
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             match self.session.read(buf) {
-                Ok(0) if !self.eof => self.do_io()?,
-                Ok(n) => return Ok(n),
+                Ok(0) if !self.eof => {
+                    debug!("ok 0 not eof");
+                    self.do_io()?
+                },
+                Ok(n) => {
+                    debug!("ok {:?}", n);
+                    return Ok(n)
+                },
                 Err(e) => if e.kind() == io::ErrorKind::ConnectionAborted {
+                    debug!("io read connection aborted");
                     self.do_io()?;
-                    return if self.eof { Ok(0) } else { Err(e) }
+                    return if self.eof {
+                        debug!("io read eof");
+                        Ok(0) } else {
+                        debug!("io read no eof");
+                        Err(e) }
                 } else {
                     return Err(e)
                 }
@@ -237,22 +274,33 @@ impl<S, C> io::Write for TlsStream<S, C>
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
+            debug!("io write is empty");
             return Ok(0);
         }
 
         loop {
             let output = self.session.write(buf)?;
+            debug!("io write loop session write");
 
             while self.session.wants_write() {
+                debug!("io write wants write");
                 match self.session.write_tls(&mut self.io) {
-                    Ok(_) => (),
+                    Ok(_) => {
+                        debug!("io write write tls ok");
+                        ()
+                    },
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => if output == 0 {
+                        debug!("io write write tls err would block output == 0");
                         // Both rustls buffer and IO buffer are blocking.
                         return Err(io::Error::from(io::ErrorKind::WouldBlock));
                     } else {
+                        debug!("io write write tls err would block output != 0");
                         break;
                     },
-                    Err(e) => return Err(e)
+                    Err(e) => {
+                        debug!("io write write tls error: {:?}", e);
+                        return Err(e)
+                    }
                 }
             }
 
@@ -264,8 +312,10 @@ impl<S, C> io::Write for TlsStream<S, C>
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        debug!("io write flush");
         self.session.flush()?;
         while self.session.wants_write() {
+            debug!("io write wants write");
             self.session.write_tls(&mut self.io)?;
         }
         self.io.flush()
@@ -285,12 +335,15 @@ impl<S, C> AsyncWrite for TlsStream<S, C>
 {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         if !self.is_shutdown {
+            debug!("async write is not shutdown");
             self.session.send_close_notify();
             self.is_shutdown = true;
         }
         while self.session.wants_write() {
+            debug!("async write session wants write");
             try_nb!(self.session.write_tls(&mut self.io));
         }
+        debug!("async write flush");
         try_nb!(self.io.flush());
         self.io.shutdown()
     }
